@@ -6,4 +6,11 @@ compatibility_date = "2024-09-23"
 binding     = "SCRIPTS_BUCKET"
 bucket_name = "doesnews-nightshift"
 
+[[kv_namespaces]]
+binding = "STATUS_KV"
+id      = "0fd5ad8c82da447fb732fd8acbd9469a"
+
+[triggers]
+crons = ["0 23 * * *"]
+
 [vars]

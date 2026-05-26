@@ -1,23 +1,24 @@
 // ─── Night Shift by Does News | doesnews.com ───────────────────────────────
-// Type definitions for the Night Shift script generator
 
 export interface Env {
   SCRIPTS_BUCKET: R2Bucket;
+  STATUS_KV: KVNamespace;
   OPENAI_API_KEY: string;
   TOMORROW_API_KEY: string;
   NEWSAPI_KEY: string;
-  OPENAI_MODEL?: string;   // defaults to "gpt-5.5"
-  HOST_NAME?: string;      // defaults to "Penelope Rose"
+  GENERATE_PASSWORD?: string;
+  OPENAI_MODEL?: string;
+  HOST_NAME?: string;
 }
 
 export interface DayForecast {
-  date: string;          // "Monday, May 26"
-  high: number;          // °F
-  low: number;           // °F
-  conditions: string;    // "Partly Cloudy"
-  precipitationProbability: number; // 0-100 %
-  windSpeed: number;     // mph
-  windGust: number;      // mph
+  date: string;
+  high: number;
+  low: number;
+  conditions: string;
+  precipitationProbability: number;
+  windSpeed: number;
+  windGust: number;
 }
 
 export interface CityForecast {
@@ -29,9 +30,9 @@ export interface CityForecast {
 }
 
 export interface WeatherBundle {
-  asOf: string;           // ISO timestamp when fetched
+  asOf: string;
   forecasts: CityForecast[];
-  fetchErrors: string[];  // cities that failed
+  fetchErrors: string[];
 }
 
 export interface NightShiftOutput {
@@ -41,20 +42,11 @@ export interface NightShiftOutput {
   elevenlabs_script: string;
   riddle_question: string;
   riddle_answer: string;
-  social_copy: {
-    episode_summary: string;
-    section_posts: { section: string; post: string }[];
-  };
+  social_copy: { episode_summary: string; section_posts: { section: string; post: string }[] };
   source_notes: string[];
-  self_validation: {
-    word_count: number;
-    estimated_minutes: number;
-    within_range: boolean;
-  };
+  self_validation: { word_count: number; estimated_minutes: number; within_range: boolean };
   chapters: { title: string }[];
 }
-
-// ─── OpenAI Responses API types ─────────────────────────────────────────────
 
 export interface ResponsesAPIRequest {
   model: string;
@@ -65,38 +57,22 @@ export interface ResponsesAPIRequest {
   temperature?: number;
 }
 
-export interface ResponsesAPIMessage {
-  role: "user" | "assistant";
-  content: string;
-}
-
-export interface ResponsesTool {
-  type: "web_search_preview";
-  search_context_size?: "low" | "medium" | "high";
-}
+export interface ResponsesAPIMessage { role: "user" | "assistant"; content: string; }
+export interface ResponsesTool { type: "web_search_preview"; search_context_size?: "low" | "medium" | "high"; }
 
 export interface ResponsesAPIResponse {
   id: string;
   object: string;
   model: string;
   output: ResponsesOutputItem[];
-  usage?: {
-    input_tokens: number;
-    output_tokens: number;
-    total_tokens: number;
-  };
+  usage?: { input_tokens: number; output_tokens: number; total_tokens: number };
   error?: { message: string; type: string; code: string };
 }
 
 export interface ResponsesOutputItem {
   type: "message" | "web_search_call" | "reasoning";
-  id?: string;
-  role?: string;
-  status?: string;
+  id?: string; role?: string; status?: string;
   content?: ResponsesContentItem[];
 }
 
-export interface ResponsesContentItem {
-  type: "output_text" | "refusal";
-  text?: string;
-}
+export interface ResponsesContentItem { type: "output_text" | "refusal"; text?: string; }

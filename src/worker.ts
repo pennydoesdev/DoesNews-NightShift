@@ -1,211 +1,164 @@
 // ─── Night Shift by Does News | doesnews.com ───────────────────────────────
-// Cloudflare Worker — Night Shift script generator.
+// Cloudflare Worker — script generator + live dashboard.
 //
-// Triggered by a cron job. On each run:
-//   1. Fetch weather forecasts from Tomorrow.io for major US metros
-//   2. Fetch today's headlines from NewsAPI.org
-//   3. Build the Night Shift prompt (master + user, with weather + news digest)
-//   4. Call the OpenAI Responses API (gpt-5.5) with web search enabled
-//   5. Parse the JSON output and extract elevenlabs_script
-//   6. Save the script as a .txt file to R2 ("Night Shift - MM-DD-YYYY.txt")
-//
-// All secrets are stored as Cloudflare Worker secrets (wrangler secret put).
-// See README.md for setup instructions.
+// Routes:
+//   GET  /                     → dashboard UI (password protected)
+//   GET  /generate?key=PWD     → trigger generation (browser-safe)
+//   GET  /status?key=PWD       → generation status JSON (polled by dashboard)
+//   GET  /script?key=PWD&date= → fetch script text from R2
 
-import type {
-  Env,
-  NightShiftOutput,
-  ResponsesAPIRequest,
-  ResponsesAPIResponse,
-} from "./types";
+import type { Env, NightShiftOutput, ResponsesAPIRequest, ResponsesAPIResponse } from "./types";
 import { fetchAllForecasts, formatWeatherForPrompt } from "./weather";
 import { fetchNewsDigest } from "./news";
 import { MASTER_PROMPT, buildUserPrompt } from "./prompt";
+import { DASHBOARD_HTML } from "./dashboard";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
-const DEFAULT_MODEL = "gpt-5.5";
-const DEFAULT_HOST  = "Penelope Rose";
+const DEFAULT_MODEL        = "gpt-5.5";
+const DEFAULT_HOST         = "Penelope Rose";
+const MIN_WORDS            = 5_800;
+const MAX_WORDS            = 6_525;
+const EXTENSION_TARGET     = 6_100;
+const MAX_EXTENSION_PASSES = 2;
 
-// At 145 wpm, a 29-31 minute script is 4,100–4,500 words.
-const MIN_WORDS = 4_100;
-const MAX_WORDS = 4_500;
+// ─── Status helpers ───────────────────────────────────────────────────────────
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+interface Status {
+  state: "idle" | "running" | "done" | "error";
+  stage: string;
+  date: string;
+  word_count: number;
+  estimated_minutes: number;
+  error: string;
+  started_at: string;
+  completed_at: string;
+}
 
-/**
- * Format today's date in "Month DD, YYYY" spoken form.
- * e.g. "May 25, 2026"
- */
+async function writeStatus(kv: KVNamespace, patch: Partial<Status>): Promise<void> {
+  try {
+    const raw     = await kv.get("status:latest");
+    const current = raw ? (JSON.parse(raw) as Status) : {} as Status;
+    await kv.put("status:latest", JSON.stringify({ ...current, ...patch }));
+  } catch (_) { /* non-fatal */ }
+}
+
+async function readStatus(kv: KVNamespace): Promise<Status> {
+  try {
+    const raw = await kv.get("status:latest");
+    if (raw) return JSON.parse(raw) as Status;
+  } catch (_) {}
+  return { state: "idle", stage: "idle", date: "", word_count: 0, estimated_minutes: 0, error: "", started_at: "", completed_at: "" };
+}
+
+// ─── Date helpers ─────────────────────────────────────────────────────────────
+
 function getTodaySpoken(): string {
   return new Date().toLocaleDateString("en-US", {
-    month: "long",
-    day: "numeric",
-    year: "numeric",
-    timeZone: "America/New_York",
+    month: "long", day: "numeric", year: "numeric", timeZone: "America/New_York",
   });
 }
 
-/**
- * Format today's date as MM-DD-YYYY for the R2 filename.
- * e.g. "05-25-2026"
- */
 function getTodayFilename(): string {
-  const now = new Date();
-  const et  = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
-  const mm   = String(et.getMonth() + 1).padStart(2, "0");
-  const dd   = String(et.getDate()).padStart(2, "0");
-  const yyyy = et.getFullYear();
-  return `${mm}-${dd}-${yyyy}`;
+  const et = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
+  return `${String(et.getMonth()+1).padStart(2,"0")}-${String(et.getDate()).padStart(2,"0")}-${et.getFullYear()}`;
 }
 
-/**
- * Count words in a string (rough estimate matching the AI's approximate count).
- */
+// ─── Utilities ────────────────────────────────────────────────────────────────
+
 function countWords(text: string): number {
   return text.trim().split(/\s+/).filter(Boolean).length;
 }
 
-/**
- * Extract the assistant's text output from an OpenAI Responses API response.
- */
 function extractResponseText(data: ResponsesAPIResponse): string {
   for (const item of data.output) {
     if (item.type === "message" && item.content) {
       for (const c of item.content) {
-        if (c.type === "output_text" && c.text) {
-          return c.text;
-        }
+        if (c.type === "output_text" && c.text) return c.text;
       }
     }
   }
-  throw new Error("No output_text found in OpenAI Responses API response");
+  throw new Error("No output_text in response");
 }
 
-/**
- * Strip a JSON code fence if the model returned one despite being told not to.
- */
-function stripMarkdownFence(raw: string): string {
-  const fenced = raw.match(/```(?:json)?\s*([\s\S]+?)```/);
-  return fenced ? fenced[1].trim() : raw.trim();
+function stripFence(raw: string): string {
+  const m = raw.match(/```(?:json)?\s*([\s\S]+?)```/);
+  return m ? m[1].trim() : raw.trim();
 }
 
-/**
- * Call the OpenAI Responses API and return the raw text output.
- * Uses gpt-5.5 with the web_search_preview built-in tool.
- */
-async function callOpenAI(
-  apiKey: string,
-  model: string,
-  systemPrompt: string,
-  userPrompt: string
-): Promise<string> {
+// ─── OpenAI: full generation (with web search) ───────────────────────────────
+
+async function callOpenAI(apiKey: string, model: string, system: string, user: string): Promise<string> {
   const body: ResponsesAPIRequest = {
-    model,
-    instructions: systemPrompt,
-    input: userPrompt,
-    tools: [
-      {
-        type: "web_search_preview",
-        search_context_size: "high",
-      },
-    ],
-    // 4,500 words of script + JSON structure ≈ ~9,000–11,000 tokens output
-    max_output_tokens: 12_000,
-    temperature: 0.7,
+    model, instructions: system, input: user,
+    tools: [{ type: "web_search_preview", search_context_size: "high" }],
+    max_output_tokens: 16_000, temperature: 0.7,
   };
-
-  const response = await fetch("https://api.openai.com/v1/responses", {
+  const res = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
     body: JSON.stringify(body),
-    // No AbortSignal — Cloudflare Workers Unbound handles wall-clock limits.
-    // OpenAI calls with web search can take 60–180 seconds; Unbound supports up to 15 min.
   });
-
-  if (!response.ok) {
-    const errText = await response.text().catch(() => "(unreadable)");
-    throw new Error(`OpenAI API error ${response.status}: ${errText.slice(0, 500)}`);
-  }
-
-  const data = (await response.json()) as ResponsesAPIResponse;
-
-  if (data.error) {
-    throw new Error(
-      `OpenAI API error: ${data.error.message} (${data.error.code})`
-    );
-  }
-
+  if (!res.ok) { const e = await res.text().catch(() => ""); throw new Error(`OpenAI ${res.status}: ${e.slice(0,400)}`); }
+  const data = (await res.json()) as ResponsesAPIResponse;
+  if (data.error) throw new Error(`OpenAI: ${data.error.message}`);
   return extractResponseText(data);
 }
 
-/**
- * Parse and validate the JSON output from the AI.
- * Returns the parsed NightShiftOutput.
- */
+// ─── OpenAI: extension pass (no web search needed) ───────────────────────────
+
+async function extendScript(apiKey: string, model: string, script: string, wordCount: number): Promise<string> {
+  const needed = EXTENSION_TARGET - wordCount;
+  const prompt = `You are editing a Night Shift by Does News podcast script.
+The script is ${wordCount} words. Minimum required: ${MIN_WORDS} (40 minutes at 145 wpm).
+Add ~${needed + 300} words by expanding — with more depth, context, and analysis — these sections:
+  • U.S. Politics + Political Trends
+  • Power Map
+  • International / Iran / Gaza
+  • Business / Economy + Cost of Living Check
+  • Healthcare + Climate
+
+Rules:
+- Do NOT change any facts, names, dates, or quotes.
+- Do NOT add new sections.
+- Keep ALL [TEN-SECOND SECTION SPACER] markers exactly in place.
+- Maintain ElevenLabs formatting (short spoken lines, paragraph spacing).
+- Return ONLY the complete extended script as plain text. No JSON. No commentary.
+
+SCRIPT:
+${script}`;
+  const body: ResponsesAPIRequest = { model, input: prompt, max_output_tokens: 6_000, temperature: 0.6 };
+  const res = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) { const e = await res.text().catch(() => ""); throw new Error(`Extend ${res.status}: ${e.slice(0,400)}`); }
+  const data = (await res.json()) as ResponsesAPIResponse;
+  if (data.error) throw new Error(`Extend: ${data.error.message}`);
+  return extractResponseText(data);
+}
+
+// ─── Parse & validate ─────────────────────────────────────────────────────────
+
 function parseAndValidate(rawText: string): NightShiftOutput {
-  const cleaned = stripMarkdownFence(rawText);
+  const cleaned = stripFence(rawText);
   let parsed: NightShiftOutput;
-
-  try {
-    parsed = JSON.parse(cleaned) as NightShiftOutput;
-  } catch (e) {
-    throw new Error(
-      `JSON parse failed: ${String(e)}\nRaw text (first 500 chars): ${cleaned.slice(0, 500)}`
-    );
-  }
-
-  if (!parsed.elevenlabs_script) {
-    throw new Error("Parsed JSON is missing the required elevenlabs_script field");
-  }
-
-  const words      = countWords(parsed.elevenlabs_script);
-  const estMinutes = +(words / 145).toFixed(1);
-
-  parsed.self_validation = {
-    word_count:        words,
-    estimated_minutes: estMinutes,
-    within_range:      words >= MIN_WORDS && words <= MAX_WORDS,
-  };
-
-  if (!parsed.self_validation.within_range) {
-    console.warn(
-      `[validate] ⚠ Script word count ${words} is outside the target range ` +
-      `${MIN_WORDS}–${MAX_WORDS}. Proceeding — manual review recommended.`
-    );
-  } else {
-    console.log(`[validate] ✓ Script OK — ${words} words / ~${estMinutes} min`);
-  }
-
+  try { parsed = JSON.parse(cleaned) as NightShiftOutput; }
+  catch (e) { throw new Error(`JSON parse failed: ${String(e)} — first 400: ${cleaned.slice(0,400)}`); }
+  if (!parsed.elevenlabs_script) throw new Error("Missing elevenlabs_script");
+  const words = countWords(parsed.elevenlabs_script);
+  parsed.self_validation = { word_count: words, estimated_minutes: +(words/145).toFixed(1), within_range: words >= MIN_WORDS && words <= MAX_WORDS };
   return parsed;
 }
 
-/**
- * Save the ElevenLabs script as a plain text file to Cloudflare R2.
- * Filename format: "Night Shift - MM-DD-YYYY.txt"
- */
-async function saveToR2(
-  bucket: R2Bucket,
-  script: string,
-  dateStr: string
-): Promise<string> {
+// ─── R2 save ──────────────────────────────────────────────────────────────────
+
+async function saveToR2(bucket: R2Bucket, script: string, dateStr: string): Promise<string> {
   const key = `Night Shift - ${dateStr}.txt`;
-
   await bucket.put(key, script, {
-    httpMetadata: {
-      contentType: "text/plain; charset=utf-8",
-    },
-    customMetadata: {
-      show:      "Night Shift",
-      network:   "Does News",
-      website:   "doesnews.com",
-      generated: new Date().toISOString(),
-    },
+    httpMetadata: { contentType: "text/plain; charset=utf-8" },
+    customMetadata: { show: "Night Shift", network: "Does News", website: "doesnews.com", generated: new Date().toISOString() },
   });
-
-  console.log(`[r2] ✓ Saved: ${key}`);
   return key;
 }
 
@@ -214,117 +167,155 @@ async function saveToR2(
 async function run(env: Env): Promise<void> {
   const model    = env.OPENAI_MODEL ?? DEFAULT_MODEL;
   const hostName = env.HOST_NAME   ?? DEFAULT_HOST;
-  const dateStr  = getTodayFilename(); // "05-25-2026"
-  const dateSp   = getTodaySpoken();  // "May 25, 2026"
+  const dateStr  = getTodayFilename();
+  const dateSp   = getTodaySpoken();
+  const kv       = env.STATUS_KV;
 
-  console.log(`[night-shift] Starting generation for ${dateSp} (model: ${model})`);
+  await writeStatus(kv, { state: "running", stage: "started", date: dateStr, started_at: new Date().toISOString(), error: "", word_count: 0 });
+  console.log(`[night-shift] Starting for ${dateSp}`);
 
-  // ── Step 1: Fetch weather from Tomorrow.io ────────────────────────────────
+  // Step 1: Weather
   let weatherBlock = "";
   try {
-    console.log("[weather] Fetching forecasts from Tomorrow.io…");
+    await writeStatus(kv, { stage: "weather" });
     const bundle = await fetchAllForecasts(env.TOMORROW_API_KEY);
     weatherBlock = formatWeatherForPrompt(bundle);
-    console.log(
-      `[weather] ✓ ${bundle.forecasts.length} cities / ${bundle.fetchErrors.length} errors`
-    );
+    console.log(`[weather] ✓ ${bundle.forecasts.length} cities`);
   } catch (err) {
-    console.error("[weather] Fatal fetch error:", err);
-    weatherBlock =
-      "WEATHER DATA: Unavailable due to an API error. Acknowledge this briefly and move on.";
+    console.error("[weather]", err);
+    weatherBlock = "WEATHER DATA: Unavailable. Acknowledge briefly and move on.";
   }
 
-  // ── Step 2: Fetch news digest from NewsAPI.org ───────────────────────────
+  // Step 2: News
   let newsDigest = "";
   try {
-    console.log("[news] Fetching headlines from NewsAPI.org…");
+    await writeStatus(kv, { stage: "news" });
     newsDigest = await fetchNewsDigest(env.NEWSAPI_KEY);
-    console.log(`[news] ✓ Digest ready (${newsDigest.length} chars)`);
+    console.log(`[news] ✓ ${newsDigest.length} chars`);
   } catch (err) {
-    console.error("[news] Fetch error:", err);
-    newsDigest = "";  // non-fatal — AI will rely on web_search
+    console.error("[news]", err);
   }
 
-  // ── Step 3: Build prompts ─────────────────────────────────────────────────
-  const userPrompt = buildUserPrompt({
-    episodeDateSpoken: dateSp,
-    hostName,
-    weatherBlock,
-    newsDigest,
-  });
+  // Step 3: Generate
+  await writeStatus(kv, { stage: "generating" });
+  const userPrompt = buildUserPrompt({ episodeDateSpoken: dateSp, hostName, weatherBlock, newsDigest });
 
-  // ── Step 4: Call OpenAI Responses API ────────────────────────────────────
-  console.log(`[openai] Calling Responses API (${model})…`);
   let rawText: string;
   try {
     rawText = await callOpenAI(env.OPENAI_API_KEY, model, MASTER_PROMPT, userPrompt);
-    console.log(`[openai] ✓ Response received (${rawText.length} chars)`);
+    console.log(`[openai] ✓ ${rawText.length} chars`);
   } catch (err) {
-    console.error("[openai] API call failed:", err);
-    throw err;
+    const msg = String(err);
+    console.error("[openai]", err);
+    await writeStatus(kv, { state: "error", stage: "error", error: msg, completed_at: new Date().toISOString() });
+    return;
   }
 
-  // ── Step 5: Parse & validate ──────────────────────────────────────────────
+  // Step 4: Parse
   let output: NightShiftOutput;
   try {
     output = parseAndValidate(rawText);
   } catch (err) {
-    console.error("[parse] Failed to parse AI output:", err);
-    console.error("[parse] Raw text (first 1,000 chars):", rawText.slice(0, 1_000));
-    throw err;
+    const msg = String(err);
+    console.error("[parse]", err);
+    await writeStatus(kv, { state: "error", stage: "error", error: msg, completed_at: new Date().toISOString() });
+    return;
   }
 
-  // ── Step 6: Save to R2 ───────────────────────────────────────────────────
-  try {
-    const key = await saveToR2(env.SCRIPTS_BUCKET, output.elevenlabs_script, dateStr);
-    console.log(`[night-shift] ✓ Done — saved to R2: ${key}`);
-  } catch (err) {
-    console.error("[r2] Upload failed:", err);
-    throw err;
+  // Step 5: Auto-extend if too short
+  let script    = output.elevenlabs_script;
+  let wordCount = countWords(script);
+  let passes    = 0;
+
+  while (wordCount < MIN_WORDS && passes < MAX_EXTENSION_PASSES) {
+    passes++;
+    await writeStatus(kv, { stage: passes === 1 ? "extending1" : "extending2" });
+    console.log(`[extend] Pass ${passes}: ${wordCount} words → targeting ${EXTENSION_TARGET}`);
+    try {
+      script    = await extendScript(env.OPENAI_API_KEY, model, script, wordCount);
+      wordCount = countWords(script);
+      console.log(`[extend] ✓ Now ${wordCount} words`);
+    } catch (err) {
+      console.error(`[extend] Pass ${passes} failed:`, err);
+      break;
+    }
   }
+
+  const finalMins = +(wordCount / 145).toFixed(1);
+
+  // Step 6: Save
+  await writeStatus(kv, { stage: "saving" });
+  try {
+    const key = await saveToR2(env.SCRIPTS_BUCKET, script, dateStr);
+    console.log(`[r2] ✓ ${key}`);
+  } catch (err) {
+    const msg = String(err);
+    console.error("[r2]", err);
+    await writeStatus(kv, { state: "error", stage: "error", error: msg, completed_at: new Date().toISOString() });
+    return;
+  }
+
+  await writeStatus(kv, {
+    state: "done", stage: "done",
+    word_count: wordCount, estimated_minutes: finalMins,
+    completed_at: new Date().toISOString(),
+  });
+  console.log(`[night-shift] ✓ Done — ${wordCount} words / ~${finalMins} min`);
 }
 
 // ─── Worker export ────────────────────────────────────────────────────────────
 
 export default {
-  /**
-   * Cron trigger handler — runs on the schedule defined in wrangler.toml.
-   * ctx.waitUntil() keeps the Worker alive for the full async pipeline.
-   */
-  async scheduled(
-    _event: ScheduledEvent,
-    env: Env,
-    ctx: ExecutionContext
-  ): Promise<void> {
+  async scheduled(_: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil(run(env));
   },
 
-  /**
-   * HTTP handler for manual / CI triggers.
-   * POST /generate → fires generation, returns 202 immediately.
-   * Any other path  → 404.
-   */
-  async fetch(
-    request: Request,
-    env: Env,
-    ctx: ExecutionContext
-  ): Promise<Response> {
-    const url = new URL(request.url);
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url  = new URL(request.url);
+    const json = (body: object, status = 200) =>
+      new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 
-    if (request.method === "POST" && url.pathname === "/generate") {
-      ctx.waitUntil(run(env));
-      return new Response(
-        JSON.stringify({ ok: true, message: "Night Shift generation started" }),
-        { status: 202, headers: { "Content-Type": "application/json" } }
+    // Auth
+    const pwd      = env.GENERATE_PASSWORD;
+    const provided = url.searchParams.get("key") ?? request.headers.get("Authorization")?.replace("Bearer ", "");
+    const authed   = !pwd || provided === pwd;
+
+    if (!authed) {
+      if (url.pathname === "/") return new Response(
+        `<!DOCTYPE html><html><body style="background:#080c14;color:#e2e8f0;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;gap:16px">
+        <div style="font-size:2rem">🌙</div>
+        <div style="font-weight:600">Night Shift</div>
+        <div style="color:#475569;font-size:0.85rem">Add <code style="color:#60a5fa">?key=PASSWORD</code> to the URL</div>
+        </body></html>`,
+        { headers: { "Content-Type": "text/html" } }
       );
+      return json({ ok: false, message: "Unauthorized — add ?key=PASSWORD to the URL" }, 401);
     }
 
-    return new Response(
-      JSON.stringify({
-        ok: false,
-        message: "Night Shift generator — POST /generate to trigger manually",
-      }),
-      { status: 404, headers: { "Content-Type": "application/json" } }
-    );
+    // Dashboard
+    if (url.pathname === "/" || url.pathname === "") {
+      return new Response(DASHBOARD_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+    }
+
+    // Trigger generation
+    if (url.pathname === "/generate") {
+      ctx.waitUntil(run(env));
+      return json({ ok: true, message: "Night Shift generation started." }, 202);
+    }
+
+    // Status
+    if (url.pathname === "/status") {
+      return json(await readStatus(env.STATUS_KV));
+    }
+
+    // Script
+    if (url.pathname === "/script") {
+      const date = url.searchParams.get("date") || getTodayFilename();
+      const obj  = await env.SCRIPTS_BUCKET.get(`Night Shift - ${date}.txt`);
+      if (!obj) return new Response("Script not found", { status: 404 });
+      return new Response(obj.body, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
+    }
+
+    return json({ ok: false, message: "Not found" }, 404);
   },
 };
