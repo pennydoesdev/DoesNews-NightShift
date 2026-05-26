@@ -1,40 +1,9 @@
-# ─── Night Shift by Does News | doesnews.com ───────────────────────────────
-# Cloudflare Worker configuration for the Night Shift script generator.
-# See README.md for full setup and deployment instructions.
-
 name               = "night-shift-generator"
 main               = "src/worker.ts"
 compatibility_date = "2024-09-23"
 
-# ─── R2 bucket binding ──────────────────────────────────────────────────────
-# Create the bucket first: wrangler r2 bucket create doesnews-nightshift
 [[r2_buckets]]
 binding     = "SCRIPTS_BUCKET"
 bucket_name = "doesnews-nightshift"
 
-# ─── Cron trigger ───────────────────────────────────────────────────────────
-# 11:00 PM UTC = 6:00 PM ET (EST) / 7:00 PM ET (EDT)
-# Runs nightly to generate the Night Shift script before broadcast.
-# Format: minute hour day-of-month month day-of-week (all UTC)
-[[triggers.crons]]
-cron = "0 23 * * *"
-
-# ─── Runtime secrets (set via: wrangler secret put <NAME>) ──────────────────
-# Do NOT put real secret values in this file.
-#
-#   wrangler secret put OPENAI_API_KEY       (required)
-#   wrangler secret put TOMORROW_API_KEY     (required — Tomorrow.io weather)
-#   wrangler secret put NEWSAPI_KEY          (required — NewsAPI.org headlines)
-#   wrangler secret put OPENAI_MODEL         (optional — defaults to gpt-5.5)
-#   wrangler secret put HOST_NAME            (optional — defaults to "Penelope Rose")
-#
 [vars]
-# Non-secret vars can go here. All sensitive values go via wrangler secret put.
-
-# ─── Execution limits note ──────────────────────────────────────────────────
-# OpenAI Responses API calls with web_search_preview can run 60–180 seconds.
-# Standard Workers (30-second wall-clock) will time out on long AI calls.
-#
-# REQUIRED: Upgrade this Worker to Workers Unbound (up to 15-min wall clock):
-#   Cloudflare Dashboard → Workers & Pages → night-shift-generator
-#   → Settings → Usage Model → Unbound
